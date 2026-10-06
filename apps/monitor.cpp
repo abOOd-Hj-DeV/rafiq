@@ -1,0 +1,301 @@
+// k230-monitor: PC harness running the little-core bridge and the big-core
+// inspector in one process.
+//
+//   phone --adb--> ScrcpySession --> InProcessQueue<MediaPacket> --> InspectorPipeline
+//                                        (stands in for DATAFIFO)          |
+//   companion app <-- VerdictDispatcher <-- InProcessQueue<Verdict> <------+
+//                                        (stands in for IPCMSG)
+//
+// Everything above the queues is the exact code that will run on the K230;
+// only the transport differs.
+
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <cstdio>
+#include <memory>
+#include <thread>
+
+#include "k230/bridge/adb_controller.hpp"
+#include "k230/bridge/scrcpy_session.hpp"
+#include "k230/bridge/verdict_dispatcher.hpp"
+#include "k230/bridge/companion_dispatcher.hpp"
+#include "k230/inspector/protection_session.hpp"
+#include "k230/bridge/layout_receiver.hpp"
+#include "k230/cli.hpp"
+#include "k230/inspector/pipeline.hpp"
+#include "k230/inspector/nsfwjs_analyzer.hpp"
+#include "k230/ipc/channel.hpp"
+#include "k230/log.hpp"
+#include "k230/recording.hpp"
+#include "protection_source.hpp"
+
+namespace {
+
+std::atomic<bool> g_stop{false};
+void on_signal(int) { g_stop = true; }
+
+// Forwards packets to the inspector queue and, optionally, to a recording.
+class TeeSink final : public k230::ipc::PacketSink {
+ public:
+  TeeSink(std::shared_ptr<k230::ipc::PacketSink> primary, std::unique_ptr<k230::RecordingWriter> recording)
+      : primary_(std::move(primary)), recording_(std::move(recording)) {}
+  bool push(k230::MediaPacket&& p) override {
+    if (recording_) recording_->write(p);
+    return primary_->push(std::move(p));
+  }
+  void close() override { primary_->close(); }
+
+ private:
+  std::shared_ptr<k230::ipc::PacketSink> primary_;
+  std::unique_ptr<k230::RecordingWriter> recording_;
+};
+
+void usage(const char* program) {
+  std::printf("%s [options]   (PC/server: phone over USB or authorized network ADB)\n", program);
+  std::puts(
+      "  --adb PATH --serial S --server-jar PATH\n"
+      "  --connect HOST:PORT           connect a previously paired network ADB device\n"
+      "  --max-size N --max-fps N --bitrate N --video-codec h264|h265 --audio-codec raw|opus --no-audio\n"
+      "  --record FILE                 also save the packet stream for `k230-inspector --replay`\n"
+      "  --dump-dir DIR                PNGs up to 10 fps + continuous WAV segments, aligned by phone PTS\n"
+      "  --nsfwjs-model PATH           use NSFWJS MobileNetV2 ONNX (PC, warning-only evaluation)\n"
+      "  --onnx-threads N              CPU inference threads (default: 1)\n"
+      "  --nsfwjs-regions N            rotate through up to N screen regions (default: 9)\n"
+      "  --layout                      fast vision: Mentor layout + two NSFWJS workers, no audio wait\n"
+      "  --layout-record FILE          record the independently framed layout stream\n"
+      "  --ui-model PATH               Android UI YOLOv8 Nano ONNX + two NSFWJS workers, without Mentor\n"
+      "  --protection-v2               opt-in parental policy; requires UI/NSFWJS and v2 native companion\n"
+      "  --verified-pts-clock          diagnostic operator assertion; native clock probes still required\n"
+      "  --ui-confidence X             detector confidence threshold (default: 0.25)\n"
+      "  --ui-iou X --ui-max-regions N  overlap threshold (0.7) and crop limit (8)\n"
+      "  --ui-min-side N               minimum crop width AND height in decoded pixels (default: 64)\n"
+      "  --ui-min-area X               minimum crop fraction of frame area (default: 0.01)\n"
+      "  --warn X --block X --confirm N --cooldown-ms N   policy tuning\n"
+      "  --duration SEC --verbose");
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  using namespace k230;
+  Cli cli(argc, argv);
+  if (cli.has("help")) {
+    usage(argv[0]);
+    return 0;
+  }
+  if (cli.has("verbose")) log::threshold() = log::Level::Debug;
+  if (cli.has("protection-v2")) {
+#ifndef K230_HAS_ONNX
+    K230_LOG_ERROR("monitor") << "--protection-v2 requires a PC ONNX build; heuristic enforcement is forbidden";
+    return 1;
+#else
+    if (!cli.has("ui-model") || !cli.has("nsfwjs-model") || cli.has("layout") ||
+        cli.has("warn") || cli.has("block") || cli.has("confirm") || cli.has("cooldown-ms")) {
+      K230_LOG_ERROR("monitor") << "v2 requires --ui-model --nsfwjs-model; fixed age policy cannot use legacy tuning/layout";
+      return 1;
+    }
+#endif
+  }
+
+  bridge::ScrcpyConfig scfg;
+  scfg.server_jar = cli.get("server-jar", scfg.server_jar);
+  scfg.serial = cli.get("serial", "");
+  if (cli.has("connect")) {
+    const auto endpoint = cli.get("connect");
+    if (endpoint.empty() || (!scfg.serial.empty() && scfg.serial != endpoint)) {
+      K230_LOG_ERROR("monitor") << "--connect requires an endpoint matching --serial when supplied";
+      return 1;
+    }
+    scfg.serial = endpoint;
+  }
+  scfg.max_size = static_cast<std::uint32_t>(cli.get_int("max-size", scfg.max_size));
+  scfg.max_fps = static_cast<std::uint32_t>(cli.get_int("max-fps", scfg.max_fps));
+  scfg.video_bit_rate = static_cast<std::uint32_t>(cli.get_int("bitrate", scfg.video_bit_rate));
+  scfg.video_codec = cli.get("video-codec", scfg.video_codec);
+  scfg.audio_codec = cli.get("audio-codec", scfg.audio_codec);
+  scfg.audio = !cli.has("no-audio");
+  if (cli.has("protection-v2") && !protection_source_verified(scfg)) {
+    K230_LOG_ERROR("monitor") << "protection requires pinned scrcpy 4.0 server SHA256";
+    return 1;
+  }
+
+  inspector::PipelineConfig pcfg;
+  pcfg.sync.audio_enabled = scfg.audio;
+  pcfg.policy.warn_threshold = static_cast<float>(cli.get_double("warn", 0.60));
+  pcfg.policy.block_threshold = static_cast<float>(cli.get_double("block", 0.85));
+  pcfg.policy.confirm_frames = static_cast<std::uint32_t>(cli.get_int("confirm", 3));
+  pcfg.policy.cooldown_us = cli.get_int("cooldown-ms", 5000) * 1000;
+  pcfg.dump_dir = cli.get("dump-dir", "");
+
+  std::unique_ptr<inspector::Analyzer> analyzer;
+  inspector::NsfwjsConfig nsfw;
+  std::unique_ptr<inspector::RegionDetector> detector;
+  if (cli.has("ui-model")) {
+    if (!cli.has("nsfwjs-model") || cli.has("layout")) {
+      K230_LOG_ERROR("monitor") << "--ui-model requires --nsfwjs-model and cannot be combined with --layout";
+      return 1;
+    }
+    inspector::UiDetectorConfig ui;
+    ui.model_path = cli.get("ui-model");
+    ui.min_side = static_cast<std::uint32_t>(cli.get_int("ui-min-side", 64));
+    ui.min_area = static_cast<float>(cli.get_double("ui-min-area", 0.01));
+    ui.confidence = static_cast<float>(cli.get_double("ui-confidence", 0.25));
+    ui.iou = static_cast<float>(cli.get_double("ui-iou", 0.7));
+    ui.max_regions = static_cast<std::uint32_t>(cli.get_int("ui-max-regions", 8));
+    detector = inspector::make_ui_detector(ui);
+    if (!detector || !detector->open()) return 1;
+  }
+  if (cli.has("layout") && !cli.has("nsfwjs-model")) {
+    K230_LOG_ERROR("monitor") << "--layout requires --nsfwjs-model";
+    return 1;
+  }
+  if (cli.has("nsfwjs-model")) {
+    nsfw.model_path = cli.get("nsfwjs-model");
+    nsfw.threads = static_cast<int>(cli.get_int("onnx-threads", 1));
+    nsfw.max_regions = static_cast<std::uint32_t>(cli.get_int("nsfwjs-regions", 9));
+    if (cli.has("layout") || cli.has("ui-model")) {
+      if (nsfw.threads != 1) {
+        K230_LOG_ERROR("monitor") << "fast vision requires --onnx-threads 1";
+        return 1;
+      }
+      analyzer = std::make_unique<inspector::HeuristicAnalyzer>();
+    } else {
+      analyzer = inspector::make_nsfwjs_analyzer(nsfw);
+      if (!analyzer || !analyzer->open()) return 1;
+    }
+    pcfg.allow_analyzer_fallback = false;
+    pcfg.policy.escalated_action = Action::Warn;
+  } else {
+    analyzer = std::make_unique<inspector::HeuristicAnalyzer>();
+  }
+
+  auto packets = std::make_shared<ipc::InProcessQueue<MediaPacket>>(128, ipc::keep_config_packets);
+  auto verdicts = std::make_shared<ipc::InProcessQueue<Verdict>>(64);
+
+  std::unique_ptr<RecordingWriter> recording;
+  if (cli.has("record")) {
+    recording = std::make_unique<RecordingWriter>(cli.get("record"));
+    if (!recording->ok()) {
+      K230_LOG_ERROR("monitor") << "cannot open recording file";
+      return 1;
+    }
+  }
+  auto sink = std::make_shared<TeeSink>(packets, std::move(recording));
+
+  bridge::AdbController adb(cli.get("adb", "adb"));
+  if (!adb.available()) {
+    K230_LOG_ERROR("monitor") << "adb not found; install android platform-tools";
+    return 1;
+  }
+  if (cli.has("connect") && !adb.connect(scfg.serial)) {
+    K230_LOG_ERROR("monitor") << "network ADB device unavailable or unauthorized; verify pairing and private routing";
+    return 1;
+  }
+
+  bridge::ScrcpySession session(scfg, adb, sink);
+  if (cli.has("protection-v2")) session.set_source_validator(protection_source_verified);
+  if (!session.start()) return 1;
+
+  inspector::InspectorPipeline pipeline(pcfg, packets, verdicts, inspector::make_default_video_decoder(),
+                                        std::move(analyzer));
+  std::unique_ptr<bridge::LayoutReceiver> layouts;
+  auto controls = std::make_shared<ipc::ControlQueue>();
+  std::shared_ptr<inspector::ProtectionSession> protection;
+  std::unique_ptr<bridge::CompanionDispatcher> companion;
+  if (cli.has("protection-v2")) {
+    protection = std::make_shared<inspector::ProtectionSession>(controls,cli.has("verified-pts-clock"));
+    pipeline.set_capture_pts_observer([protection](std::int64_t pts) { protection->observe_capture_pts(pts); });
+    if (cli.has("verified-pts-clock")) K230_LOG_INFO("protection-v2") << "operator clock assertion is diagnostic; native probes are authoritative";
+    companion = std::make_unique<bridge::CompanionDispatcher>(bridge::CompanionConfig{},adb,session.device_serial(),controls,
+      [protection](const auto& m) { protection->receive(m); },[protection] { protection->disconnected(); });
+  }
+  std::unique_ptr<inspector::FastVision> vision;
+  if (cli.has("ui-model")) {
+    vision = std::make_unique<inspector::FastVision>(
+        [nsfw] { return inspector::make_nsfwjs_region_analyzer(nsfw); }, std::move(detector), pcfg.policy, verdicts);
+  }
+  if (cli.has("layout")) {
+    auto cache = std::make_shared<LayoutCache>();
+    bridge::LayoutReceiverConfig lcfg;
+    lcfg.recording = cli.get("layout-record", "");
+    layouts = std::make_unique<bridge::LayoutReceiver>(lcfg, adb, session.device_serial(), cache);
+    layouts->start();
+    vision = std::make_unique<inspector::FastVision>(
+        [nsfw] { return inspector::make_nsfwjs_region_analyzer(nsfw); }, cache, pcfg.policy, verdicts);
+  }
+  if (vision) {
+    if (protection) vision->set_batch_observer([protection](auto batch) { protection->analyze(std::move(batch)); });
+    vision->set_observer([](const inspector::VideoFrame& f, const inspector::Scores& sc, const Verdict& v) {
+      K230_LOG_INFO("vision") << "pts=" << f.pts_us << " " << inspector::describe_scores(sc)
+                              << " -> " << to_string(v.action) << "/" << to_string(v.category);
+    });
+    pipeline.set_vision(std::move(vision));
+  }
+  pipeline.set_observer([](const inspector::SyncedSample& s, const inspector::Scores& sc, const Verdict& v) {
+    if (v.action >= Action::Warn || log::threshold() <= log::Level::Debug) {
+      K230_LOG_INFO("sample") << "pts=" << s.frame.pts_us << " audio=" << s.audio_filled_us / 1000 << "ms"
+                              << (s.audio_complete ? "" : " (incomplete)") << " " << inspector::describe_scores(sc)
+                              << " -> " << to_string(v.action);
+    }
+  });
+  std::atomic<bool> inspector_done{false};
+  bool inspector_ok = false;
+  std::thread inspector_thread([&] {
+    inspector_ok = pipeline.run();
+    inspector_done = true;
+  });
+
+  bridge::CompanionConfig diagnostic_config;
+  diagnostic_config.local_only = static_cast<bool>(protection);
+  bridge::VerdictDispatcher dispatcher(diagnostic_config, adb, session.device_serial(), verdicts);
+  dispatcher.set_observer([](const Verdict& v) {
+    if (v.action >= Action::Warn) std::fputs(to_json_line(v).c_str(), stdout);
+  });
+  if (companion) companion->start();
+  else dispatcher.start();
+
+  std::signal(SIGINT, on_signal);
+  std::signal(SIGTERM, on_signal);
+
+  const long duration = cli.get_int("duration", 0);
+  const auto t0 = std::chrono::steady_clock::now();
+  auto next_report = t0 + std::chrono::seconds(5);
+  while (!g_stop && session.running() && !inspector_done) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const auto now = std::chrono::steady_clock::now();
+    if (duration > 0 && now - t0 >= std::chrono::seconds(duration)) break;
+    if (now >= next_report) {
+      next_report = now + std::chrono::seconds(5);
+      const auto v = session.video_stats();
+      const auto a = session.audio_stats();
+      const auto& st = pipeline.stats();
+      const auto* vision_stats = pipeline.vision_stats();
+      const auto& ss = pipeline.sync().stats();
+      K230_LOG_INFO("monitor") << "in: video=" << v.packets << " audio=" << a.packets << " | decoded=" << st.frames_decoded
+                               << " analyzed=" << (vision_stats ? vision_stats->analyzed.load() : st.samples_analyzed)
+                               << " vision_drops=" << (vision_stats ? vision_stats->dropped.load() : 0)
+                               << " skipped=" << (vision_stats ? vision_stats->skipped.load() : 0)
+                               << " ignored_small=" << (vision_stats ? vision_stats->ignored_small.load() : 0)
+                               << " incomplete=" << ss.emitted_incomplete
+                               << " av_lead=" << ss.last_av_lead_us / 1000 << "ms"
+                               << " | queue=" << packets->size() << " drops=" << packets->drops()
+                               << " gaps=" << st.video_gaps
+                               << " | verdicts sent=" << dispatcher.sent() << " dropped=" << dispatcher.dropped();
+    }
+  }
+
+  session.stop();
+  packets->close();
+  inspector_thread.join();
+  controls->close();
+  if (companion) {
+    companion->stop();
+    const auto ps = protection->stats();
+    K230_LOG_INFO("protection-v2") << "submitted=" << ps.submitted << " executed=" << ps.executed << " failed=" << ps.failed
+      << " unknown=" << ps.unknown << " rejected=" << ps.rejected << " sent=" << companion->sent() << " dropped=" << companion->dropped();
+  }
+  dispatcher.stop();
+  K230_LOG_INFO("monitor") << "stopped";
+  return inspector_ok ? 0 : 1;
+}
