@@ -1,0 +1,16 @@
+--- a/nonai_2d_dev.c
++++ b/nonai_2d_dev.c
+@@ -616,6 +616,13 @@
+             }
+             chn->cfg.nonai_2d_calc_mode = (enum k_nonai_2d_calc_mode)ctrl->val;
+             break;
++        case V4L2_CID_USER_NONAI2D_COEFF:
++            if (!ctrl->p_new.p_u8)
++                return -EINVAL;
++            memcpy(chn->custom_csc_coef, ctrl->p_new.p_u8,
++                   sizeof(chn->custom_csc_coef));
++            chn->custom_csc_coef_en = 1;
++            break;
+         case V4L2_CID_USER_NONAI2D_OSD_ATTR:
+             if (ctrl->p_new.p_u8) {
+                 nonai2d_osd_attr *attrs = (nonai2d_osd_attr *)ctrl->p_new.p_u8;

@@ -1,0 +1,6 @@
+add_executable(k230-make-test-recording make_test_recording.cpp)
+target_link_libraries(k230-make-test-recording PRIVATE k230_common k230_inspector)
+add_executable(k230-layout-dump layout_dump.cpp)
+target_link_libraries(k230-layout-dump PRIVATE k230_bridge)
+add_executable(k230-mvp-force-stop-probe mvp_force_stop_probe.cpp)
+target_link_libraries(k230-mvp-force-stop-probe PRIVATE k230_bridge)
