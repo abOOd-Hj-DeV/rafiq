@@ -22,7 +22,7 @@ namespace k230::ipc {
 //     4..7  u32  codec id
 //     8..15 i64  pts_us   (kNoPts for config packets)
 //    16..19 u32  payload length
-//    20..23 u32  reserved
+//    20..23 u32  sequence
 //
 //   Verdict (24 bytes, no payload)
 //     0     u8   magic 'V'

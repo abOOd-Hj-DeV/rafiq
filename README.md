@@ -1,5 +1,42 @@
 # k230-control
 
+## Dual-Linux MVP
+With the service stopped and one authorized child connected, the staged Android
+MVP can be installed through little Linux without exposing the phone to the
+host. The helper streams chunks instead of storing the APK in little Linux's
+RAM filesystem, verifies the full stream SHA-256, then commits Android's
+installation session. A failed transfer leaves the old app intact and the
+pipeline paused:
+
+```sh
+python3 /root/rafiq/mvp_install_child.py \
+  --apk /root/rafiq/mentor-mvp.apk --sha256 <verified-sha256>
+```
+
+
+The dual-Linux MVP uses the little core for ADB/scrcpy and the big core for
+`VPU → Non-AI2D → AI2D → KPU`. Enable `--mvp-force-stop` in the inspector
+and `--force-stop` in the bridge. A confirmed block stops the attributed
+foreground application with `am force-stop --user current`, verifies the
+current user's stopped state, then requests Mentor's protected
+`MvpBreakActivity`. This path does not depend on age or protection-v2 pairing.
+Three distinct fresh, package/session/window-consistent layout samples are
+required. Child-mode `PARTIAL | FOREGROUND_ONLY` snapshots prove foreground
+identity without UI geometry; ordinary partial or stale layouts, changed
+foregrounds and protected packages fail closed.
+An activity-start result is not visual proof that the puzzle was displayed.
+
+Mentor's child role provides the Accessibility puzzle and 20-minute
+continuous-use reminder. The guardian role shows imported aggregate reports;
+`tools/mvp_guardian_relay.py --board <management-serial> --guardian <adb-serial>`
+relays reports locally through ADB, not through a cloud service.
+
+Capture orientation is fixed for this MVP. Dynamic source-resolution
+reconfiguration in the current MVX/VPU path remains unsupported and can
+trigger a kernel/driver failure; do not enable that experimental path.
+Video decoding remains hardware-only, with no software fallback. Emulator
+tests do not establish physical Vivo behavior or long-running K230 stability.
+
 Parental-control pipeline built around a **01Studio CanMV K230 (2 GB)** sitting
 between an Android phone and its owner:
 

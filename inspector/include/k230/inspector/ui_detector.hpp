@@ -38,6 +38,8 @@ class RegionDetector {
 std::vector<float> ui_input(const VideoFrame& frame);
 UiDetections ui_regions(const VideoFrame& frame, const std::vector<float>& predictions,
                         const UiDetectorConfig& config);
+UiDetections ui_quantized_regions(const VideoFrame& frame, std::vector<float> predictions,
+                                  const UiDetectorConfig& config, bool class_logits = false);
 std::unique_ptr<RegionDetector> make_ui_detector(const UiDetectorConfig& config);
 
 }  // namespace k230::inspector

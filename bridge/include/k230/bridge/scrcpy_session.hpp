@@ -60,6 +60,7 @@ class ScrcpySession {
   bool start();
   // True while both reader threads are alive and the server process is running.
   bool running() const;
+  bool delivery_failed() const { return delivery_failed_; }
   void stop();
 
   const std::string& device_serial() const { return serial_; }
@@ -67,6 +68,7 @@ class ScrcpySession {
   ScrcpyDemuxer::Stats video_stats() const;
   ScrcpyDemuxer::Stats audio_stats() const;
   std::uint32_t scid() const { return scid_; }
+  std::int64_t latest_video_pts() const { return latest_video_pts_.load(); }
 
   // Exposed for tests / documentation.
   std::vector<std::string> server_command() const;
@@ -76,6 +78,7 @@ class ScrcpySession {
  private:
   bool connect_video_socket();
   bool connect_audio_socket();
+  void forward_packet(MediaPacket&& packet);
   void reader_loop(TcpSocket& socket, ScrcpyDemuxer& demuxer, const char* tag);
 
   ScrcpyConfig config_;
@@ -95,7 +98,9 @@ class ScrcpySession {
   std::thread video_thread_;
   std::thread audio_thread_;
   std::atomic<bool> stop_{false};
+  std::atomic<bool> delivery_failed_{false};
   std::atomic<int> live_readers_{0};
+  std::atomic<std::int64_t> latest_video_pts_{kNoPts};
 
   mutable std::mutex state_mutex_;
   std::optional<VideoSessionInfo> video_session_;

@@ -65,6 +65,7 @@ class InspectorPipeline {
  private:
   void run_loop();
   void handle(const MediaPacket& packet);
+  void submit_decoded_frames(std::vector<VideoFrame>& frames);
   void drain(std::int64_t now_wall_us);
   void emit(SyncedSample&& sample);
   static std::int64_t now_us();

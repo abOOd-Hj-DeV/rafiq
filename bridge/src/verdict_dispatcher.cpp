@@ -10,7 +10,9 @@ constexpr const char* kTag = "verdict";
 
 VerdictDispatcher::VerdictDispatcher(CompanionConfig config, AdbController adb, std::string serial,
                                      std::shared_ptr<ipc::VerdictSource> source)
-    : config_(std::move(config)), adb_(std::move(adb)), serial_(std::move(serial)), source_(std::move(source)) {}
+    : config_(std::move(config)), adb_(std::move(adb)), serial_(std::move(serial)), source_(std::move(source)) {
+  if (config_.force_stop) force_stop_ = std::make_unique<ForceStopExecutor>(adb_, serial_);
+}
 
 VerdictDispatcher::~VerdictDispatcher() { stop(); }
 
@@ -61,6 +63,31 @@ void VerdictDispatcher::loop() {
       continue;
     }
     if (observer_) observer_(*verdict);
+    std::optional<std::string> attributed_package;
+    if (force_stop_) {
+      const auto layout = config_.layouts ? config_.layouts->match(verdict->pts_us) : std::nullopt;
+      const auto latest = config_.latest_capture_pts ? config_.latest_capture_pts() : -1;
+      attributed_package = attribution_.observe(layout, verdict->pts_us, latest);
+      K230_LOG_DEBUG(kTag) << "attribution pts=" << verdict->pts_us << " latest=" << latest
+          << " layout=" << (layout ? describe_layout(*layout) : "missing")
+          << " confirmed=" << attributed_package.value_or("none");
+    }
+    if (force_stop_ && verdict->action >= Action::Block) {
+      if (!attributed_package) {
+        ++dropped_;
+        K230_LOG_WARN(kTag) << "force-stop rejected: stale or unattributed frame";
+        continue;
+      }
+      const auto result = force_stop_->execute(*attributed_package);
+      if (result.stopped && result.intervention_started) {
+        ++sent_;
+        K230_LOG_INFO(kTag) << "force-stopped " << result.package << " and started intervention";
+      } else {
+        ++dropped_;
+        K230_LOG_ERROR(kTag) << "force-stop rejected for " << result.package << ": " << result.error;
+      }
+      continue;
+    }
     if (config_.local_only || verdict->action < config_.min_action) continue;
 
     const std::string line = to_json_line(*verdict);

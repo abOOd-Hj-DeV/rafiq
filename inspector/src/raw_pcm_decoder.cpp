@@ -5,7 +5,11 @@
 
 namespace k230::inspector {
 
-bool RawPcmAudioDecoder::open(CodecId codec) { return codec == CodecId::Raw; }
+bool RawPcmAudioDecoder::open(CodecId codec) {
+  clock_anchor_us_ = -1;
+  clock_frames_ = 0;
+  return codec == CodecId::Raw;
+}
 
 bool RawPcmAudioDecoder::decode(const MediaPacket& packet, std::vector<PcmChunk>& out) {
   if (packet.is_config) return true;
@@ -15,6 +19,18 @@ bool RawPcmAudioDecoder::decode(const MediaPacket& packet, std::vector<PcmChunk>
   chunk.sample_rate = 48000;
   chunk.channels = 2;
   chunk.samples.resize(packet.data.size() / 2);
+  constexpr std::int64_t jitter_us = 2000;
+  const auto expected_pts = clock_anchor_us_ + clock_frames_ * 1'000'000 / chunk.sample_rate;
+  const auto delta = packet.pts_us - expected_pts;
+  if (clock_anchor_us_ < 0 || packet.seq != previous_sequence_ + 1 ||
+      delta < -jitter_us || delta > jitter_us) {
+    chunk.timing_discontinuity = clock_anchor_us_ >= 0;
+    clock_anchor_us_ = packet.pts_us;
+    clock_frames_ = 0;
+  }
+  chunk.sample_clock_pts_us = clock_anchor_us_ + clock_frames_ * 1'000'000 / chunk.sample_rate;
+  clock_frames_ += static_cast<std::int64_t>(chunk.frames());
+  previous_sequence_ = packet.seq;
   for (std::size_t i = 0; i < chunk.samples.size(); ++i) {
     const std::uint16_t value = static_cast<std::uint16_t>(packet.data[2 * i]) |
                                 static_cast<std::uint16_t>(packet.data[2 * i + 1]) << 8;

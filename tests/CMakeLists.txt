@@ -5,14 +5,18 @@ add_executable(k230_tests
   wire_test.cpp
   layout_test.cpp
   queue_test.cpp
+  shared_memory_test.cpp
   pcm_ring_test.cpp
   frame_dump_test.cpp
   continuous_capture_test.cpp
   sync_engine_test.cpp
   policy_test.cpp
   nsfwjs_test.cpp
+  kpu_runtime_test.cpp
   ui_detector_test.cpp
   adb_test.cpp
+  force_stop_executor_test.cpp
+  red_demo_test.cpp
   tcp_socket_test.cpp
   scrcpy_stream_test.cpp
   protection_v2_test.cpp
@@ -21,9 +25,13 @@ target_link_libraries(k230_tests PRIVATE k230_bridge k230_inspector GTest::gtest
 target_compile_definitions(k230_tests PRIVATE
   K230_TEST_UI_MODEL="${PROJECT_SOURCE_DIR}/models/android-ui-yolov8n.onnx"
   K230_TEST_NSFWJS_MODEL="${PROJECT_SOURCE_DIR}/models/nsfwjs-mobilenet-v2.onnx")
+target_compile_definitions(k230_tests PRIVATE
+  K230_TEST_KPU_WORKER="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/kpu_worker_fixture.py")
 target_compile_definitions(k230_tests PRIVATE K230_LAYOUT_GOLDEN="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/layout-kotlin-v1.bin")
 target_compile_definitions(k230_tests PRIVATE K230_LAYOUT_LIVE="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/layout-android-api35.bin")
-target_compile_definitions(k230_tests PRIVATE K230_V2_FIXTURES="${PROJECT_SOURCE_DIR}/protocol/v2/fixtures")
+target_compile_definitions(k230_tests PRIVATE
+  K230_V2_FIXTURES="${PROJECT_SOURCE_DIR}/protocol/v2/fixtures"
+  K230_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 
 include(GoogleTest)
 gtest_discover_tests(k230_tests)

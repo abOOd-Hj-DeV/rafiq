@@ -68,6 +68,23 @@ TEST(LayoutWire, RejectsMalformedLengthsVersionsDimensionsAndBounds) {
   EXPECT_FALSE(decode_layout(bytes.data(), kLayoutMaxPayload + 1));
 }
 
+TEST(LayoutWire, ForegroundOnlyRequiresPartialEmptyGeometryAndValidIdentity) {
+  auto bytes = golden();
+  bytes[10] = kLayoutPartial | kLayoutForegroundOnly;
+  EXPECT_FALSE(decode_layout(bytes.data() + 4, bytes.size() - 4));
+  put32(bytes, 72, 0);
+  bytes.resize(4 + kLayoutHeaderSize + std::string("dev.example").size());
+  put32(bytes, 0, static_cast<std::uint32_t>(bytes.size() - 4));
+  ASSERT_TRUE(decode_layout(bytes.data() + 4, bytes.size() - 4));
+  for (const auto flags : {4, 7, 8}) {
+    bytes[10] = flags;
+    EXPECT_FALSE(decode_layout(bytes.data() + 4, bytes.size() - 4));
+  }
+  bytes[10] = kLayoutPartial | kLayoutForegroundOnly;
+  put32(bytes, 68, 0xffffffff);
+  EXPECT_FALSE(decode_layout(bytes.data() + 4, bytes.size() - 4));
+}
+
 TEST(LayoutCache, RejectsDuplicateSequenceSessionAndExpiredFutureLayouts) {
   LayoutCache cache;
   auto s = snapshot();

@@ -8,8 +8,10 @@
 #include <thread>
 
 #include "k230/bridge/adb_controller.hpp"
+#include "k230/bridge/force_stop_executor.hpp"
 #include "k230/bridge/tcp_socket.hpp"
 #include "k230/ipc/channel.hpp"
+#include "k230/layout.hpp"
 #include "k230/verdict.hpp"
 
 namespace k230::bridge {
@@ -24,6 +26,9 @@ struct CompanionConfig {
   // Verdicts with action < min_action are logged locally but not sent.
   Action min_action = Action::Warn;
   bool local_only = false;
+  bool force_stop = false;
+  std::shared_ptr<LayoutCache> layouts;
+  std::function<std::int64_t()> latest_capture_pts;
 };
 
 // Consumes verdicts from the big core and forwards them, as JSON lines, to the
@@ -54,6 +59,8 @@ class VerdictDispatcher {
   std::shared_ptr<ipc::VerdictSource> source_;
   Observer observer_;
   TcpSocket socket_;
+  std::unique_ptr<ForceStopExecutor> force_stop_;
+  FrameAttribution attribution_;
   std::thread thread_;
   std::atomic<bool> stop_{false};
   std::atomic<std::uint64_t> sent_{0};

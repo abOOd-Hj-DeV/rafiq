@@ -83,8 +83,9 @@ void InspectorPipeline::run_loop() {
   }
 
   std::vector<VideoFrame> frames;
-  if (video_open_) video_decoder_->flush(frames);
+  if (video_open_ && !stop_) video_decoder_->flush(frames);
   for (auto& f : frames) {
+    ++stats_.frames_decoded;
     if (vision_) vision_->submit(f);
     if (capture_) capture_->push_frame(f);
     sync_.push_video(std::move(f), now_us());
@@ -119,8 +120,7 @@ void InspectorPipeline::handle(const MediaPacket& packet) {
     if (!video_open_) {
       if (!video_decoder_->open(packet.codec)) {
         K230_LOG_ERROR(kTag) << "cannot open video decoder for " << to_string(packet.codec);
-        stop_ = true;
-        return;
+        throw std::runtime_error("requested video decoder failed to open; no software fallback");
       }
       video_open_ = true;
     }
@@ -139,19 +139,9 @@ void InspectorPipeline::handle(const MediaPacket& packet) {
     }
     std::vector<VideoFrame> frames;
     if (!video_decoder_->decode(packet, frames)) {
-      K230_LOG_WARN(kTag) << "video decoder failure; waiting for key frame";
-      if (vision_) vision_->discontinuity();
-      wait_key_frame_ = true;
-      return;
+      throw std::runtime_error("fatal video decoder failure; no software fallback");
     }
-    const std::int64_t now = now_us();
-    for (auto& f : frames) {
-      ++stats_.frames_decoded;
-      if (capture_pts_observer_) capture_pts_observer_(f.pts_us);
-      if (vision_) vision_->submit(f);
-      if (capture_) capture_->push_frame(f);
-      sync_.push_video(std::move(f), now);
-    }
+    submit_decoded_frames(frames);
     return;
   }
 
@@ -177,7 +167,24 @@ void InspectorPipeline::handle(const MediaPacket& packet) {
   }
 }
 
+void InspectorPipeline::submit_decoded_frames(std::vector<VideoFrame>& frames) {
+  const auto now = now_us();
+  for (auto& frame : frames) {
+    ++stats_.frames_decoded;
+    if (capture_pts_observer_) capture_pts_observer_(frame.pts_us);
+    if (vision_) vision_->submit(frame);
+    if (capture_) capture_->push_frame(frame);
+    sync_.push_video(std::move(frame), now);
+  }
+}
+
 void InspectorPipeline::drain(std::int64_t now_wall_us) {
+  if (video_open_ && !stop_) {
+    std::vector<VideoFrame> frames;
+    if (!video_decoder_->poll_frames(frames))
+      throw std::runtime_error("fatal video decoder polling failure; no software fallback");
+    submit_decoded_frames(frames);
+  }
   std::vector<SyncedSample> samples;
   sync_.poll(now_wall_us, samples);
   for (auto& s : samples) emit(std::move(s));

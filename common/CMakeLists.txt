@@ -5,6 +5,7 @@ add_library(k230_common STATIC
   src/layout.cpp
   src/companion_v2.cpp
   src/ipc/datafifo_channel.cpp
+  src/ipc/shared_memory_channel.cpp
 )
 
 target_include_directories(k230_common PUBLIC

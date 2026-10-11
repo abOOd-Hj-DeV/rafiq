@@ -91,6 +91,24 @@ TEST(Policy, WarnBandProducesWarn) {
   EXPECT_EQ(v.category, Category::Nudity);
 }
 
+TEST(Policy, MvpConfirmsBlockAtSeventyPercent) {
+  auto config = cfg();
+  config.block_threshold = 0.70f;
+  Policy p(config);
+  EXPECT_EQ(p.evaluate(0, nud(0.70f)).action, Action::Log);
+  EXPECT_EQ(p.evaluate(1, nud(0.70f)).action, Action::Log);
+  EXPECT_EQ(p.evaluate(2, nud(0.70f)).action, Action::Block);
+}
+
+TEST(Policy, MvpDoesNotBlockBelowSeventyPercent) {
+  auto config = cfg();
+  config.block_threshold = 0.70f;
+  Policy p(config);
+  EXPECT_EQ(p.evaluate(0, nud(0.699f)).action, Action::Log);
+  EXPECT_EQ(p.evaluate(1, nud(0.699f)).action, Action::Log);
+  EXPECT_EQ(p.evaluate(2, nud(0.699f)).action, Action::Warn);
+}
+
 TEST(Policy, MostSevereCategoryWins) {
   Policy p(cfg());
   Scores s;

@@ -27,7 +27,8 @@ class PcmRing {
   // or not-yet-arrived chunks) are zero-filled so the output length always
   // equals the requested duration. `filled_us` reports how much real audio
   // was present.
-  std::vector<std::int16_t> extract(std::int64_t start_us, std::int64_t end_us, std::int64_t* filled_us = nullptr) const;
+  std::vector<std::int16_t> extract(std::int64_t start_us, std::int64_t end_us,
+                                  std::int64_t* filled_us = nullptr, bool* timing_contiguous = nullptr) const;
 
   // Drop everything that ends before `pts_us`.
   void drop_before(std::int64_t pts_us);

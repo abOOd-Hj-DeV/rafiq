@@ -21,8 +21,8 @@ namespace k230::ipc {
 //   InProcessQueue<T>   both "cores" in one PC process (development / tests)
 //   DataFifo / IpcMsg   K230 SDK shared-memory transports (see datafifo_channel.hpp)
 //
-// Producers must never block on a full queue in the media path: dropping the
-// oldest non-config packet is preferable to stalling the USB reader thread.
+// Hardware capture must use backpressure or stop on rejected media; compressed
+// access units cannot be discarded while continuing a protection session.
 template <typename T>
 class Sink {
  public:

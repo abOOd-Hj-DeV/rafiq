@@ -51,6 +51,12 @@ class VdecVideoDecoder final : public VideoDecoder {
 
 }  // namespace
 
-std::unique_ptr<VideoDecoder> make_vdec_video_decoder() { return std::make_unique<VdecVideoDecoder>(); }
+std::unique_ptr<VideoDecoder> make_vdec_video_decoder() {
+#ifdef K230_HAS_V4L2
+  return make_v4l2_video_decoder();
+#else
+  return std::make_unique<VdecVideoDecoder>();
+#endif
+}
 
 }  // namespace k230::inspector

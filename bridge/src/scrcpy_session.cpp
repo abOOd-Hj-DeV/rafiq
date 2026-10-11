@@ -41,6 +41,7 @@ std::vector<std::string> ScrcpySession::server_command() const {
       "log_level=" + config_.log_level,
       "video=true",
       "video_codec=" + config_.video_codec,
+      "capture_orientation=@",
       "max_size=" + std::to_string(config_.max_size),
       "max_fps=" + std::to_string(config_.max_fps),
       "video_bit_rate=" + std::to_string(config_.video_bit_rate),
@@ -103,7 +104,7 @@ bool ScrcpySession::start() {
     }
     if (on_session_) on_session_(info);
   };
-  video_cb.on_packet = [this](MediaPacket&& p) { sink_->push(std::move(p)); };
+  video_cb.on_packet = [this](MediaPacket&& p) { forward_packet(std::move(p)); };
   ScrcpyDemuxer::Options video_opts;
   video_opts.stream = StreamType::Video;
   video_demuxer_ = std::make_unique<ScrcpyDemuxer>(video_opts, std::move(video_cb));
@@ -111,19 +112,30 @@ bool ScrcpySession::start() {
   if (config_.audio) {
     ScrcpyDemuxer::Callbacks audio_cb;
     audio_cb.on_codec = [](CodecId id) { K230_LOG_INFO(kTag) << "audio codec: " << to_string(id); };
-    audio_cb.on_packet = [this](MediaPacket&& p) { sink_->push(std::move(p)); };
+    audio_cb.on_packet = [this](MediaPacket&& p) { forward_packet(std::move(p)); };
     ScrcpyDemuxer::Options audio_opts;
     audio_opts.stream = StreamType::Audio;
     audio_demuxer_ = std::make_unique<ScrcpyDemuxer>(audio_opts, std::move(audio_cb));
   }
 
   stop_ = false;
+  delivery_failed_ = false;
   live_readers_ = config_.audio ? 2 : 1;
   video_thread_ = std::thread([this] { reader_loop(video_socket_, *video_demuxer_, "video"); });
   if (config_.audio) {
     audio_thread_ = std::thread([this] { reader_loop(audio_socket_, *audio_demuxer_, "audio"); });
   }
   return true;
+}
+
+void ScrcpySession::forward_packet(MediaPacket&& packet) {
+  if (stop_) return;
+  if (packet.stream == StreamType::Video && !packet.is_config) latest_video_pts_ = packet.pts_us;
+  if (!sink_->push(std::move(packet)) && !stop_) {
+    K230_LOG_ERROR(kTag) << "media delivery failed; stopping rather than losing compressed packets";
+    delivery_failed_ = true;
+    stop_ = true;
+  }
 }
 
 bool ScrcpySession::connect_video_socket() {
@@ -184,6 +196,7 @@ bool ScrcpySession::running() const {
 
 void ScrcpySession::stop() {
   stop_ = true;
+  sink_->close();
   video_socket_.shutdown();
   audio_socket_.shutdown();
   if (video_thread_.joinable()) video_thread_.join();

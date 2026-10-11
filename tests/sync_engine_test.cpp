@@ -45,6 +45,25 @@ TEST(SyncEngine, FrameWaitsUntilAudioCoversWindow) {
   EXPECT_EQ(e.pending(), 0u);
 }
 
+TEST(SyncEngine, SamplingLimitsAnalysisWithoutChangingSourcePtsOrAudioCoverage) {
+  auto config = cfg();
+  config.min_frame_interval_us = 500000;
+  SyncEngine engine(config);
+  engine.push_video(make_frame(1000000), 0);
+  engine.push_video(make_frame(1100000), 0);
+  engine.push_video(make_frame(1500000), 0);
+  engine.push_audio(make_pcm(850000, 750000, 5));
+  std::vector<SyncedSample> out;
+  engine.poll(0, out);
+  ASSERT_EQ(out.size(), 2u);
+  EXPECT_EQ(out[0].frame.pts_us, 1000000);
+  EXPECT_EQ(out[1].frame.pts_us, 1500000);
+  EXPECT_TRUE(out[0].audio_complete);
+  EXPECT_TRUE(out[1].audio_complete);
+  EXPECT_EQ(engine.stats().frames_in, 3u);
+  EXPECT_EQ(engine.stats().frames_skipped, 1u);
+}
+
 TEST(SyncEngine, UsesPhonePtsNotArrivalTime) {
   SyncEngine e(cfg());
   std::vector<SyncedSample> out;

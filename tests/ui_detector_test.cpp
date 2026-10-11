@@ -156,6 +156,37 @@ TEST(UiRegions, RejectsMalformedOutputsAndConfiguration) {
   EXPECT_THROW(ui_regions(frame, predictions(), config), std::invalid_argument);
 }
 
+TEST(UiRegions, QuantizedProbabilitiesAllowOneStepButRejectCorruption) {
+  const auto frame = test::make_frame(100, 640, 640);
+  auto output = predictions();
+  box(output, 0, 200, 250, 200, 100, 9, 1.0025f);
+  output[4 * kUiBoxes + 1] = -0.002525f;
+  EXPECT_THROW(ui_regions(frame, output, UiDetectorConfig{}), std::runtime_error);
+  EXPECT_EQ(ui_quantized_regions(frame, output, UiDetectorConfig{}).regions.size(), 1u);
+  for (auto invalid : {-.01f, 1.01f, std::numeric_limits<float>::quiet_NaN()}) {
+    output[4 * kUiBoxes + 1] = invalid;
+    EXPECT_THROW(ui_quantized_regions(frame, output, UiDetectorConfig{}), std::runtime_error);
+  }
+}
+
+TEST(UiRegions, LogitsUseStableSigmoidWithoutChangingBoxesOrWeakeningProbabilityContract) {
+  const auto frame = test::make_frame(100, 640, 640);
+  auto output = predictions();
+  std::fill(output.begin() + 4 * kUiBoxes, output.end(), -100.0f);
+  box(output, 0, 200, 250, 200, 100, 9, 100.0f);
+  const auto regions = ui_quantized_regions(frame, output, UiDetectorConfig{}, true);
+  ASSERT_EQ(regions.regions.size(), 1u);
+  EXPECT_EQ(regions.regions[0].x, 100u);
+  EXPECT_EQ(regions.regions[0].width, 200u);
+  EXPECT_THROW(ui_quantized_regions(frame, output, UiDetectorConfig{}), std::runtime_error);
+  for (const auto invalid : {std::numeric_limits<float>::quiet_NaN(),
+                            std::numeric_limits<float>::infinity(),
+                            -std::numeric_limits<float>::infinity()}) {
+    output[4 * kUiBoxes + 1] = invalid;
+    EXPECT_THROW(ui_quantized_regions(frame, output, UiDetectorConfig{}, true), std::runtime_error);
+  }
+}
+
 TEST(UiRegions, SmallHigherConfidenceBoxesCannotSuppressEligibleMediaAndCropLimitUsesConfidence) {
   auto output = predictions();
   box(output, 0, 100, 100, 63, 100, 9, 0.99f);

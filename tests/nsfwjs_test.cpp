@@ -25,13 +25,18 @@ VideoFrame black_frame(std::int64_t pts_us = 2'300'000) {
 
 class TestDecoder final : public VideoDecoder {
  public:
-  bool open(CodecId) override { return true; }
+  explicit TestDecoder(bool opens = true, bool decodes = true) : opens_(opens), decodes_(decodes) {}
+  bool open(CodecId) override { return opens_; }
   bool decode(const MediaPacket& packet, std::vector<VideoFrame>& out) override {
+    if (!decodes_) return false;
     out.push_back(black_frame(packet.pts_us));
     return true;
   }
-  void flush(std::vector<VideoFrame>&) override {}
+  void flush(std::vector<VideoFrame>&) override { ++flushes; }
+  unsigned flushes = 0;
   const char* name() const override { return "test-decoder"; }
+ private:
+  bool opens_, decodes_;
 };
 
 class FailingAnalyzer final : public Analyzer {
@@ -42,6 +47,43 @@ class FailingAnalyzer final : public Analyzer {
   const char* name() const override { return "failing-analyzer"; }
  private:
   bool opens_;
+};
+
+class IdleVideoSource final : public ipc::PacketSource {
+ public:
+  std::optional<MediaPacket> pop(std::chrono::milliseconds) override {
+    if (calls_++ != 0) return std::nullopt;
+    MediaPacket packet;
+    packet.stream = StreamType::Video;
+    packet.codec = CodecId::H264;
+    packet.pts_us = 2'300'000;
+    return packet;
+  }
+  bool closed() const override { return calls_ > 2; }
+ private:
+  unsigned calls_ = 0;
+};
+
+class DelayedDecoder final : public VideoDecoder {
+ public:
+  explicit DelayedDecoder(bool polling_succeeds) : polling_succeeds_(polling_succeeds) {}
+  bool open(CodecId) override { return true; }
+  bool decode(const MediaPacket& packet, std::vector<VideoFrame>&) override {
+    pending_ = black_frame(packet.pts_us);
+    return true;
+  }
+  bool poll_frames(std::vector<VideoFrame>& out) override {
+    if (++polls < 2) return true;
+    if (!polling_succeeds_) return false;
+    out.push_back(std::move(pending_));
+    return true;
+  }
+  void flush(std::vector<VideoFrame>&) override {}
+  const char* name() const override { return "delayed-decoder"; }
+  unsigned polls = 0;
+ private:
+  bool polling_succeeds_;
+  VideoFrame pending_;
 };
 
 std::shared_ptr<ipc::InProcessQueue<MediaPacket>> packets(int count) {
@@ -165,6 +207,96 @@ TEST(NsfwjsPipeline, RequestedAnalyzerCannotFallBackToHeuristic) {
   EXPECT_TRUE(verdicts->closed());
   EXPECT_EQ(verdicts->size(), 0u);
 }
+
+TEST(NsfwjsPipeline, RequestedStopAbortsHardwareDrainButNormalEndFlushesDecodedFrames) {
+  for (const bool requested_stop : {false, true}) {
+    PipelineConfig config;
+    config.sync.audio_enabled = false;
+    auto verdicts = std::make_shared<ipc::InProcessQueue<Verdict>>(8);
+    auto decoder = std::make_unique<TestDecoder>();
+    const auto* tracked = decoder.get();
+    InspectorPipeline pipeline(config, packets(3), verdicts, std::move(decoder),
+                               std::make_unique<HeuristicAnalyzer>());
+    if (requested_stop)
+      pipeline.set_capture_pts_observer([&pipeline](std::int64_t) { pipeline.request_stop(); });
+    EXPECT_TRUE(pipeline.run());
+    EXPECT_EQ(tracked->flushes, requested_stop ? 0u : 1u);
+    EXPECT_EQ(pipeline.stats().frames_decoded, requested_stop ? 1u : 3u);
+  }
+}
+
+TEST(NsfwjsPipeline, FatalVideoFailureStopsWithoutFallbackOrVerdicts) {
+  for (const bool fails_open : {false, true}) {
+    PipelineConfig config;
+    config.sync.audio_enabled = false;
+    config.allow_analyzer_fallback = false;
+    auto verdicts = std::make_shared<ipc::InProcessQueue<Verdict>>(8);
+    InspectorPipeline pipeline(config, packets(3), verdicts,
+                               std::make_unique<TestDecoder>(!fails_open, false),
+                               std::make_unique<HeuristicAnalyzer>());
+    EXPECT_FALSE(pipeline.run());
+    EXPECT_EQ(pipeline.stats().packets, 1u);
+    EXPECT_EQ(pipeline.stats().frames_decoded, 0u);
+    EXPECT_EQ(pipeline.stats().samples_analyzed, 0u);
+    EXPECT_TRUE(verdicts->closed());
+    EXPECT_EQ(verdicts->size(), 0u);
+  }
+}
+
+TEST(NsfwjsPipeline, PollsHardwareOutputWithoutWaitingForAnotherVideoPacket) {
+  PipelineConfig config;
+  config.sync.audio_enabled = false;
+  config.allow_analyzer_fallback = false;
+  auto verdicts = std::make_shared<ipc::InProcessQueue<Verdict>>(8);
+  auto decoder = std::make_unique<DelayedDecoder>(true);
+  const auto* tracked = decoder.get();
+  InspectorPipeline pipeline(config, std::make_shared<IdleVideoSource>(), verdicts,
+                             std::move(decoder), std::make_unique<HeuristicAnalyzer>());
+  std::vector<std::int64_t> captured;
+  pipeline.set_capture_pts_observer([&](std::int64_t pts) { captured.push_back(pts); });
+  EXPECT_TRUE(pipeline.run());
+  EXPECT_EQ(tracked->polls, 2u);
+  EXPECT_EQ(pipeline.stats().video_packets, 1u);
+  EXPECT_EQ(pipeline.stats().frames_decoded, 1u);
+  EXPECT_EQ(pipeline.stats().samples_analyzed, 1u);
+  EXPECT_EQ(captured, (std::vector<std::int64_t>{2'300'000}));
+}
+
+TEST(NsfwjsPipeline, HardwarePollingFailureStopsWithoutFallbackOrVerdicts) {
+  PipelineConfig config;
+  config.sync.audio_enabled = false;
+  config.allow_analyzer_fallback = false;
+  auto verdicts = std::make_shared<ipc::InProcessQueue<Verdict>>(8);
+  InspectorPipeline pipeline(config, std::make_shared<IdleVideoSource>(), verdicts,
+                             std::make_unique<DelayedDecoder>(false),
+                             std::make_unique<HeuristicAnalyzer>());
+  EXPECT_FALSE(pipeline.run());
+  EXPECT_EQ(pipeline.stats().video_packets, 1u);
+  EXPECT_EQ(pipeline.stats().frames_decoded, 0u);
+  EXPECT_EQ(pipeline.stats().samples_analyzed, 0u);
+  EXPECT_TRUE(verdicts->closed());
+  EXPECT_EQ(verdicts->size(), 0u);
+}
+
+#ifdef K230_HAS_V4L2_API
+TEST(VpuDecoder, MissingOrNonVpuDeviceFailsWithoutSoftwareFallback) {
+  for (const auto* device : {"/dev/rafiq-no-such-vpu", "/dev/null"}) {
+    V4l2DecoderConfig config;
+    config.device = device;
+    auto decoder = make_v4l2_video_decoder(config);
+    EXPECT_STREQ(decoder->name(), "k230-vpu-v4l2");
+    EXPECT_FALSE(decoder->open(CodecId::H264));
+    std::vector<VideoFrame> frames;
+    MediaPacket packet;
+    packet.codec = CodecId::H264;
+    packet.data = {0, 0, 0, 1};
+    EXPECT_FALSE(decoder->decode(packet, frames));
+    decoder->flush(frames);
+    EXPECT_TRUE(frames.empty());
+    EXPECT_FALSE(decoder->open(CodecId::AV1));
+  }
+}
+#endif
 
 TEST(NsfwjsPipeline, CaptureClockObserverPreservesDecodedPtsBeforeInferenceOrSync) {
   PipelineConfig config; config.sync.audio_enabled = false; config.allow_analyzer_fallback = false;

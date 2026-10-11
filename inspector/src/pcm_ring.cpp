@@ -15,7 +15,7 @@ void PcmRing::push(PcmChunk chunk) {
   drop_before(newest - history_us_);
 }
 
-std::int64_t PcmRing::oldest_pts_us() const { return chunks_.empty() ? -1 : chunks_.front().pts_us; }
+std::int64_t PcmRing::oldest_pts_us() const { return chunks_.empty() ? -1 : chunks_.front().timeline_pts_us(); }
 
 std::int64_t PcmRing::newest_end_pts_us() const { return chunks_.empty() ? -1 : chunks_.back().end_pts_us(); }
 
@@ -23,9 +23,11 @@ void PcmRing::drop_before(std::int64_t pts_us) {
   while (!chunks_.empty() && chunks_.front().end_pts_us() <= pts_us) chunks_.pop_front();
 }
 
-std::vector<std::int16_t> PcmRing::extract(std::int64_t start_us, std::int64_t end_us, std::int64_t* filled_us) const {
+std::vector<std::int16_t> PcmRing::extract(std::int64_t start_us, std::int64_t end_us,
+                                        std::int64_t* filled_us, bool* timing_contiguous) const {
   std::vector<std::int16_t> out;
   if (filled_us) *filled_us = 0;
+  if (timing_contiguous) *timing_contiguous = true;
   if (end_us <= start_us) return out;
 
   const auto frames_for = [this](std::int64_t us) {
@@ -37,13 +39,15 @@ std::vector<std::int16_t> PcmRing::extract(std::int64_t start_us, std::int64_t e
   std::vector<bool> covered(static_cast<std::size_t>(total_frames), false);
   for (const auto& c : chunks_) {
     if (c.end_pts_us() <= start_us) continue;
-    if (c.pts_us >= end_us) break;
-    const std::int64_t overlap_start = std::max(c.pts_us, start_us);
-    const std::int64_t overlap_end = std::min(c.end_pts_us(), end_us);
-    const std::int64_t src_frame = frames_for(overlap_start - c.pts_us);
-    const std::int64_t dst_frame = frames_for(overlap_start - start_us);
-    std::int64_t n = frames_for(overlap_end - overlap_start);
-    n = std::min({n, static_cast<std::int64_t>(c.frames()) - src_frame, total_frames - dst_frame});
+    if (c.timeline_pts_us() >= end_us) break;
+    if (timing_contiguous && c.timing_discontinuity && c.timeline_pts_us() > start_us)
+      *timing_contiguous = false;
+    const auto numerator = (c.timeline_pts_us() - start_us) * sample_rate_;
+    const auto offset = numerator >= 0 ? (numerator + 500'000) / 1'000'000
+                                      : -((-numerator + 500'000) / 1'000'000);
+    const std::int64_t src_frame = std::max<std::int64_t>(0, -offset);
+    const std::int64_t dst_frame = std::max<std::int64_t>(0, offset);
+    const auto n = std::min(static_cast<std::int64_t>(c.frames()) - src_frame, total_frames - dst_frame);
     if (n <= 0) continue;
     std::copy_n(c.samples.begin() + static_cast<std::ptrdiff_t>(src_frame * channels_),
                 static_cast<std::ptrdiff_t>(n * channels_),

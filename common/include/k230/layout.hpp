@@ -12,6 +12,7 @@ namespace k230 {
 
 constexpr std::uint16_t kLayoutPartial = 1;
 constexpr std::uint16_t kLayoutInvalidate = 2;
+constexpr std::uint16_t kLayoutForegroundOnly = 4;
 constexpr std::size_t kLayoutHeaderSize = 76;
 constexpr std::size_t kLayoutNodeSize = 24;
 constexpr std::size_t kLayoutMaxNodes = 256;

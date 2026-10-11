@@ -106,7 +106,8 @@ UiDetections ui_regions(const VideoFrame& frame, const std::vector<float>& predi
     for (std::size_t c = 0; c < kUiClasses; ++c) {
       const float score = predictions[(4 + c) * kUiBoxes + i];
       if (!std::isfinite(score) || score < 0 || score > 1) {
-        throw std::runtime_error("UI detector produced invalid class probabilities");
+        throw std::runtime_error("UI detector produced invalid class probability " +
+                                 std::to_string(score));
       }
       if (score > confidence) { confidence = score; label = c; }
     }
@@ -152,6 +153,26 @@ UiDetections ui_regions(const VideoFrame& frame, const std::vector<float>& predi
     } else result.complete = false;
   }
   return result;
+}
+
+UiDetections ui_quantized_regions(const VideoFrame& frame, std::vector<float> predictions,
+                                  const UiDetectorConfig& config, bool class_logits) {
+  if (predictions.size() != (kUiClasses + 4) * kUiBoxes)
+    throw std::invalid_argument("UI KPU output must be FP32 [1,25,8400]");
+  constexpr float tolerance = 1.0f / 255.0f;
+  for (std::size_t index = 4 * kUiBoxes; index < predictions.size(); ++index) {
+    auto& score = predictions[index];
+    if (class_logits) {
+      if (!std::isfinite(score)) throw std::runtime_error("nonfinite UI KPU class logit");
+      const float exponential = std::exp(-std::abs(score));
+      score = score >= 0 ? 1.0f / (1.0f + exponential) : exponential / (1.0f + exponential);
+      continue;
+    }
+    if (!std::isfinite(score) || score < -tolerance || score > 1 + tolerance)
+      throw std::runtime_error("UI KPU output exceeded one probability quantization step");
+    score = std::clamp(score, 0.0f, 1.0f);
+  }
+  return ui_regions(frame, predictions, config);
 }
 
 #ifdef K230_HAS_ONNX

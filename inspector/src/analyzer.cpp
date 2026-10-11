@@ -8,6 +8,11 @@ namespace k230::inspector {
 std::string describe_scores(const Scores& scores) {
   std::ostringstream out;
   out << "nudity=" << scores.nudity << " rms=" << scores.audio_level;
+  if (scores.audio_event) {
+    const auto& audio = *scores.audio_event;
+    out << " yamnet_class=" << audio.class_index << " yamnet_probability=" << audio.probability
+        << " yamnet_end_pts=" << audio.end_pts_us << " yamnet_inference_ms=" << audio.inference_ms;
+  }
   if (scores.nsfwjs) {
     const auto& nsfw = *scores.nsfwjs;
     out << " Drawing=" << nsfw.drawing << " Hentai=" << nsfw.hentai << " Neutral=" << nsfw.neutral

@@ -9,6 +9,12 @@ SyncEngine::SyncEngine(SyncConfig config)
 
 void SyncEngine::push_video(VideoFrame frame, std::int64_t now_wall_us) {
   ++stats_.frames_in;
+  if (last_selected_pts_us_ >= 0 && frame.pts_us >= last_selected_pts_us_ &&
+      frame.pts_us - last_selected_pts_us_ < config_.min_frame_interval_us) {
+    ++stats_.frames_skipped;
+    return;
+  }
+  last_selected_pts_us_ = frame.pts_us;
   pending_.push_back(Pending{std::move(frame), now_wall_us});
 }
 
@@ -25,8 +31,9 @@ SyncedSample SyncEngine::release(Pending&& p) {
     s.audio_end_us = s.frame.pts_us + config_.audio_after_us;
     s.sample_rate = ring_.sample_rate();
     s.channels = ring_.channels();
-    s.audio = ring_.extract(s.audio_start_us, s.audio_end_us, &s.audio_filled_us);
-    s.audio_complete = s.audio_filled_us >= s.audio_end_us - s.audio_start_us;
+    bool timing_contiguous = true;
+    s.audio = ring_.extract(s.audio_start_us, s.audio_end_us, &s.audio_filled_us, &timing_contiguous);
+    s.audio_complete = timing_contiguous && s.audio_filled_us >= s.audio_end_us - s.audio_start_us;
     stats_.last_av_lead_us = ring_.newest_end_pts_us() - s.frame.pts_us;
   } else {
     s.audio_complete = true;

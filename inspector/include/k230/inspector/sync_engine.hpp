@@ -28,6 +28,7 @@ struct SyncConfig {
   std::int64_t audio_after_us = 500'000;
   std::int64_t max_wait_us = 1'000'000;
   std::size_t max_pending_frames = 8;
+  std::int64_t min_frame_interval_us = 0;
 };
 
 struct SyncedSample {
@@ -45,6 +46,7 @@ class SyncEngine {
  public:
   struct Stats {
     std::uint64_t frames_in = 0;
+    std::uint64_t frames_skipped = 0;
     std::uint64_t audio_chunks_in = 0;
     std::uint64_t emitted = 0;
     std::uint64_t emitted_incomplete = 0;
@@ -79,6 +81,7 @@ class SyncEngine {
   PcmRing ring_;
   std::deque<Pending> pending_;
   Stats stats_;
+  std::int64_t last_selected_pts_us_ = -1;
 };
 
 }  // namespace k230::inspector

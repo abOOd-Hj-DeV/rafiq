@@ -16,8 +16,10 @@
 #include "k230/cli.hpp"
 #include "k230/inspector/pipeline.hpp"
 #include "k230/inspector/nsfwjs_analyzer.hpp"
+#include "k230/inspector/protection_session.hpp"
 #include "k230/ipc/channel.hpp"
 #include "k230/ipc/datafifo_channel.hpp"
+#include "k230/ipc/shared_memory_channel.hpp"
 #include "k230/log.hpp"
 #include "k230/recording.hpp"
 
@@ -40,6 +42,11 @@ class StdoutVerdictSink final : public k230::ipc::VerdictSink {
     std::fflush(stdout);
     return true;
   }
+  void close() override {}
+};
+class NullVerdictSink final : public k230::ipc::VerdictSink {
+ public:
+  bool push(k230::Verdict&&) override { return true; }
   void close() override {}
 };
 
@@ -109,7 +116,7 @@ void replay_thread(const std::string& path, std::shared_ptr<k230::ipc::InProcess
 void usage() {
   std::puts(
       "k230-inspector [options]\n"
-      "  --source datafifo|replay      packet source (default: replay if --replay given, else datafifo)\n"
+      "  --source shmem|datafifo|replay  Linux/Linux shared memory, SDK, or recording\n"
       "  --replay FILE                 .k230rec produced by `k230-bridge --record`\n"
       "  --realtime                    pace the replay by PTS instead of as fast as possible\n"
       "  --layout-replay FILE          fast vision using recorded Mentor snapshots and --nsfwjs-model\n"
@@ -118,8 +125,12 @@ void usage() {
       "  --ui-iou X --ui-max-regions N  overlap threshold (0.7) and crop limit (8)\n"
       "  --ui-min-side N               minimum crop width AND height in decoded pixels (default: 64)\n"
       "  --ui-min-area X               minimum crop fraction of frame area (default: 0.01)\n"
-      "  --verdicts ipcmsg|stdout      where verdicts go (default: stdout on PC)\n"
+      "  --verdicts shmem|ipcmsg|stdout  where verdicts go\n"
       "  --kmodel PATH                 use the KPU analyzer with this model (K230 only)\n"
+      "  --ui-kmodel PATH              Android UI KModel feeding regions to --kmodel\n"
+      "  --ui-logits                   UI KModel emits class logits; exact sigmoid after KPU\n"
+      "  --audio-kmodel PATH           YAMNet audio events on KPU (not profanity detection)\n"
+      "  --kpu-worker PATH             nncase Python worker (default: beside executable)\n"
       "  --nsfwjs-model PATH           use NSFWJS MobileNetV2 ONNX (PC, warning-only evaluation)\n"
       "  --onnx-threads N              CPU inference threads (default: 1)\n"
       "  --nsfwjs-regions N            rotate through up to N screen regions (default: 9)\n"
@@ -127,6 +138,7 @@ void usage() {
       "  --no-audio                    ignore audio, release frames immediately\n"
       "  --warn X --block X --confirm N --cooldown-ms N   policy tuning\n"
       "  --audio-before-ms N --audio-after-ms N --max-wait-ms N  sync tuning\n"
+      "  --analysis-fps N              sample decoded frames for analysis (0: all)\n"
       "  --verbose");
 }
 
@@ -141,16 +153,24 @@ int main(int argc, char** argv) {
     return 0;
   }
   if (cli.has("verbose")) log::threshold() = log::Level::Debug;
+#ifndef K230_LINUX_PROTECTION_V2
   if (cli.has("protection-v2")) {
     K230_LOG_ERROR("inspector") << "standalone v2 enforcement unsupported: SDK bidirectional control/KPU adapter unverified; use PC k230-monitor";
     return 1;
   }
+#endif
 
   PipelineConfig cfg;
   cfg.sync.audio_enabled = !cli.has("no-audio");
   cfg.sync.audio_before_us = cli.get_int("audio-before-ms", 2500) * 1000;
   cfg.sync.audio_after_us = cli.get_int("audio-after-ms", 500) * 1000;
   cfg.sync.max_wait_us = cli.get_int("max-wait-ms", 1000) * 1000;
+  const auto analysis_fps = cli.get_int("analysis-fps", 0);
+  if (analysis_fps < 0 || analysis_fps > 120) {
+    K230_LOG_ERROR("inspector") << "analysis-fps must be 0..120";
+    return 1;
+  }
+  cfg.sync.min_frame_interval_us = analysis_fps ? 1000000 / analysis_fps : 0;
   cfg.policy.warn_threshold = static_cast<float>(cli.get_double("warn", 0.60));
   cfg.policy.block_threshold = static_cast<float>(cli.get_double("block", 0.85));
   cfg.policy.confirm_frames = static_cast<std::uint32_t>(cli.get_int("confirm", 3));
@@ -161,6 +181,18 @@ int main(int argc, char** argv) {
   if (cli.has("kmodel") && cli.has("nsfwjs-model")) {
     K230_LOG_ERROR("inspector") << "choose either --kmodel or --nsfwjs-model";
     return 1;
+  }
+  if (cli.has("ui-kmodel") && !cli.has("kmodel")) {
+    K230_LOG_ERROR("inspector") << "--ui-kmodel requires --kmodel";
+    return 2;
+  }
+  if (cli.has("ui-logits") && !cli.has("ui-kmodel")) {
+    K230_LOG_ERROR("inspector") << "--ui-logits requires --ui-kmodel";
+    return 2;
+  }
+  if (cli.has("audio-kmodel") && (!cli.has("kmodel") || cli.has("no-audio"))) {
+    K230_LOG_ERROR("inspector") << "--audio-kmodel requires --kmodel and enabled audio";
+    return 2;
   }
   std::unique_ptr<Analyzer> analyzer;
   NsfwjsConfig nsfw;
@@ -204,13 +236,27 @@ int main(int argc, char** argv) {
   } else if (cli.has("kmodel")) {
     KpuConfig kpu;
     kpu.kmodel_path = cli.get("kmodel");
+    kpu.ui_kmodel_path = cli.get("ui-kmodel");
+    kpu.ui_logits = cli.has("ui-logits");
+    kpu.audio_kmodel_path = cli.get("audio-kmodel");
+    kpu.worker_path = cli.get("kpu-worker", "");
+    kpu.max_regions = static_cast<std::uint32_t>(cli.get_int("nsfwjs-regions", 9));
     analyzer = make_kpu_analyzer(kpu);
+    cfg.allow_analyzer_fallback = false;
+    cfg.policy.escalated_action = Action::Warn;
   } else {
     analyzer = std::make_unique<HeuristicAnalyzer>();
   }
+  if (cli.has("mvp-force-stop")) cfg.policy.escalated_action = Action::Block;
 
   const std::string source_kind = cli.get("source", cli.has("replay") ? "replay" : "datafifo");
-  const std::string verdict_kind = cli.get("verdicts", source_kind == "replay" ? "stdout" : "ipcmsg");
+  const std::string verdict_kind = cli.get("verdicts", source_kind == "replay" ? "stdout" :
+                                                      source_kind == "shmem" ? "shmem" : "ipcmsg");
+  const bool protection_v2 = cli.has("protection-v2");
+  if (protection_v2 && (source_kind != "shmem" || !cli.has("kmodel") || !cli.has("ui-kmodel"))) {
+    K230_LOG_ERROR("inspector") << "v2 requires shared memory plus KPU content and UI models";
+    return 1;
+  }
 
   std::shared_ptr<ipc::PacketSource> source;
   std::shared_ptr<ipc::VerdictSink> verdicts;
@@ -221,11 +267,17 @@ int main(int argc, char** argv) {
       source = queue;
       replay = std::thread(replay_thread, cli.get("replay", "capture.k230rec"), queue, cli.has("realtime"),
                            layouts, cli.get("layout-replay", ""));
+    } else if (source_kind == "shmem") {
+      source = std::make_shared<ipc::SharedPacketSource>();
     } else {
       source = std::make_shared<ipc::DataFifoPacketSource>(ipc::DataFifoConfig{});
     }
-    if (verdict_kind == "stdout") {
+    if (protection_v2) {
+      verdicts = std::make_shared<NullVerdictSink>();
+    } else if (verdict_kind == "stdout") {
       verdicts = std::make_shared<StdoutVerdictSink>();
+    } else if (verdict_kind == "shmem") {
+      verdicts = std::make_shared<ipc::SharedVerdictSink>();
     } else {
       verdicts = std::make_shared<ipc::IpcMsgVerdictSink>(ipc::IpcMsgConfig{});
     }
@@ -237,6 +289,43 @@ int main(int argc, char** argv) {
   }
 
   InspectorPipeline pipeline(cfg, source, verdicts, make_default_video_decoder(), std::move(analyzer));
+  std::shared_ptr<ipc::ControlSink> control_down;
+  std::shared_ptr<ipc::ControlSource> control_up;
+  std::unique_ptr<ProtectionSession> protection;
+  std::thread control_receiver;
+  std::atomic<bool> control_failed{false};
+  if (protection_v2) {
+    try {
+      control_down = std::make_shared<ipc::SharedControlSink>(ipc::shared_control_down_config());
+      control_up = std::make_shared<ipc::SharedControlSource>(ipc::shared_control_up_config());
+      protection = std::make_unique<ProtectionSession>(control_down, true);
+      pipeline.set_capture_pts_observer([&protection](std::int64_t pts) { protection->observe_capture_pts(pts); });
+      control_receiver = std::thread([&] {
+        try {
+          while (!g_stop) {
+            auto message = control_up->pop(std::chrono::milliseconds(50));
+            if (!message) {
+              if (control_up->closed()) {
+                if (!g_stop) { control_failed = true; pipeline.request_stop(); }
+                break;
+              }
+              continue;
+            }
+            if (message->is_null()) protection->disconnected();
+            else protection->receive(*message);
+          }
+          protection->disconnected();
+        } catch (const std::exception& error) {
+          K230_LOG_ERROR("protection") << "control channel failed: " << error.what();
+          control_failed = true;
+          pipeline.request_stop();
+        }
+      });
+    } catch (const std::exception& error) {
+      K230_LOG_ERROR("protection") << error.what();
+      return 1;
+    }
+  }
   std::unique_ptr<FastVision> vision;
   if (cli.has("ui-model")) {
     vision = std::make_unique<FastVision>(
@@ -257,6 +346,7 @@ int main(int argc, char** argv) {
   std::signal(SIGTERM, on_signal);
 
   pipeline.set_observer([&](const SyncedSample& s, const Scores& scores, const Verdict& v) {
+    if (!g_stop && !control_failed && protection && scores.protection) protection->analyze(*scores.protection);
     if (v.action >= Action::Warn || log::threshold() <= log::Level::Debug) {
       K230_LOG_INFO("sample") << "pts=" << s.frame.pts_us << " " << s.frame.width << "x" << s.frame.height
                               << " audio=" << s.audio_filled_us / 1000 << "/" << (s.audio_end_us - s.audio_start_us) / 1000
@@ -268,12 +358,15 @@ int main(int argc, char** argv) {
   const bool ok = pipeline.run();
   g_pipeline = nullptr;
   g_stop = true;
+  if (control_down) control_down->close();
+  if (control_receiver.joinable()) control_receiver.join();
   if (replay.joinable()) replay.join();
 
   const auto& st = pipeline.stats();
   const auto& ss = pipeline.sync().stats();
   K230_LOG_INFO("inspector") << "sync: emitted=" << ss.emitted << " incomplete=" << ss.emitted_incomplete
+                             << " sampled_out=" << ss.frames_skipped
                              << " backpressure=" << ss.emitted_backpressure << " last_av_lead_ms=" << ss.last_av_lead_us / 1000
                              << " | verdicts escalated=" << st.verdicts_escalated;
-  return !ok || (st.video_packets > 0 && st.frames_decoded == 0) ? 1 : 0;
+  return !ok || control_failed || (st.video_packets > 0 && st.frames_decoded == 0) ? 1 : 0;
 }

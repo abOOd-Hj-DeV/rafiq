@@ -1,0 +1,9 @@
+--- a/mmz.c
++++ b/mmz.c
+@@ -44,5 +44,5 @@
+     while (op_size > 0) {
+-        __asm volatile("dcache.civa %0" : : "r"(op_addr));
++        __asm volatile("th.dcache.civa %0" : : "r"(op_addr));
+         op_addr += linesize;
+         op_size -= linesize;
+     }

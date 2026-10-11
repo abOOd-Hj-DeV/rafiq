@@ -26,7 +26,7 @@ std::optional<LayoutSnapshot> decode_layout(const std::uint8_t* p, std::size_t s
   s.session = u64(p + 8);
   s.sequence = u64(p + 16);
   const auto sampled = u64(p + 24), completed = u64(p + 32), valid_from = u64(p + 40);
-  if (s.flags > 3 || s.session == 0 || s.session > static_cast<std::uint64_t>(INT64_MAX) ||
+  if (s.flags > 7 || s.session == 0 || s.session > static_cast<std::uint64_t>(INT64_MAX) ||
       s.sequence == 0 || s.sequence > static_cast<std::uint64_t>(INT64_MAX) ||
       sampled > static_cast<std::uint64_t>(INT64_MAX) || completed > static_cast<std::uint64_t>(INT64_MAX) ||
       completed < sampled || valid_from > sampled) return std::nullopt;
@@ -47,6 +47,9 @@ std::optional<LayoutSnapshot> decode_layout(const std::uint8_t* p, std::size_t s
   for (const unsigned char c : s.package) {
     if (c < 33 || c > 126) return std::nullopt;
   }
+  if ((s.flags & kLayoutForegroundOnly) &&
+      (s.flags != (kLayoutForegroundOnly | kLayoutPartial) || count != 0 ||
+       s.package.empty() || s.window_id < 0)) return std::nullopt;
   std::unordered_set<std::uint32_t> ids;
   for (std::uint32_t i = 0; i < count; ++i) {
     const auto* n = p + kLayoutHeaderSize + name_size + i * kLayoutNodeSize;

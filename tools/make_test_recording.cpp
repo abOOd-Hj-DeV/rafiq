@@ -48,15 +48,22 @@ void paint(AVFrame* f, double t) {
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::fprintf(stderr, "usage: %s out.k230rec [seconds] [fps]\n", argv[0]);
+    std::fprintf(stderr, "usage: %s out.k230rec [seconds] [fps] [h264|h265]\n", argv[0]);
     return 2;
   }
   const std::string out_path = argv[1];
   const int seconds = argc > 2 ? std::atoi(argv[2]) : 8;
   const int fps = argc > 3 ? std::atoi(argv[3]) : 10;
+  const std::string codec_name = argc > 4 ? argv[4] : "h264";
+  const CodecId codec_id = codec_name == "h264" ? CodecId::H264 :
+                           codec_name == "h265" ? CodecId::H265 : CodecId::Unknown;
+  if (codec_id == CodecId::Unknown) {
+    std::fprintf(stderr, "codec must be h264 or h265\n");
+    return 2;
+  }
   const std::int64_t frame_us = 1'000'000 / fps;
 
-  const AVCodec* codec = avcodec_find_encoder_by_name("libx264");
+  const AVCodec* codec = avcodec_find_encoder_by_name(codec_id == CodecId::H264 ? "libx264" : "libx265");
   if (!codec) {
     std::fprintf(stderr, "libx264 encoder not available in this FFmpeg build\n");
     return 1;
@@ -82,10 +89,12 @@ int main(int argc, char** argv) {
 
   MediaPacket cfg;
   cfg.stream = StreamType::Video;
-  cfg.codec = CodecId::H264;
+  cfg.codec = codec_id;
   cfg.is_config = true;
-  cfg.data.assign(ctx->extradata, ctx->extradata + ctx->extradata_size);
-  rec.write(cfg);
+  if (ctx->extradata_size > 0) {
+    cfg.data.assign(ctx->extradata, ctx->extradata + ctx->extradata_size);
+    rec.write(cfg);
+  }
 
   AVFrame* frame = av_frame_alloc();
   frame->format = ctx->pix_fmt;
@@ -126,7 +135,7 @@ int main(int argc, char** argv) {
     while (avcodec_receive_packet(ctx, pkt) == 0) {
       MediaPacket v;
       v.stream = StreamType::Video;
-      v.codec = CodecId::H264;
+      v.codec = codec_id;
       v.pts_us = pkt->pts;
       v.is_key_frame = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
       v.data.assign(pkt->data, pkt->data + pkt->size);

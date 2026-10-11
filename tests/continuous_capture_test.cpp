@@ -40,12 +40,13 @@ std::vector<std::uint8_t> read_bytes(const std::filesystem::path& path) {
 
 }  // namespace
 
-TEST(ScrcpyCommand, DuplicatesPlaybackAudioAndRequestsTenFps) {
+TEST(ScrcpyCommand, LocksCaptureOrientationAndDuplicatesPlaybackAudioAtTenFps) {
   auto queue = std::make_shared<ipc::InProcessQueue<MediaPacket>>(8);
   bridge::ScrcpySession session(bridge::ScrcpyConfig{}, bridge::AdbController{}, queue);
   const auto command = session.server_command();
   for (const std::string option : {"audio=true", "audio_source=playback", "audio_dup=true",
-                                   "audio_codec=raw", "max_fps=10", "send_frame_meta=true"}) {
+                                   "audio_codec=raw", "max_fps=10", "send_frame_meta=true",
+                                   "capture_orientation=@"}) {
     EXPECT_NE(std::find(command.begin(), command.end(), option), command.end()) << option;
   }
 }

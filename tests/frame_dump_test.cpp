@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -33,6 +34,83 @@ TEST(AudioDecode, RawPcmPreservesSignedLittleEndianSamples) {
   packet.data.pop_back();
   EXPECT_FALSE(decoder.decode(packet, chunks));
   EXPECT_EQ(chunks.size(), 1u);
+}
+
+TEST(AudioDecode, BoundedRawTimestampJitterPreservesSourcePtsAndCompleteSampleGrid) {
+  RawPcmAudioDecoder decoder;
+  ASSERT_TRUE(decoder.open(k230::CodecId::Raw));
+  PcmRing ring(3'000'000);
+  k230::MediaPacket packet;
+  packet.codec = k230::CodecId::Raw;
+  packet.stream = k230::StreamType::Audio;
+  packet.data.assign(4096, 1);
+  for (std::uint32_t index = 0; index < 80; ++index) {
+    const auto clock = 1'000'000 + static_cast<std::int64_t>(index) * 1024 * 1'000'000 / 48000;
+    packet.seq = index;
+    packet.pts_us = clock + (index == 0 ? 0 : index % 2 ? 1200 : -1200);
+    std::vector<PcmChunk> chunks;
+    ASSERT_TRUE(decoder.decode(packet, chunks));
+    ASSERT_EQ(chunks.size(), 1u);
+    EXPECT_EQ(chunks[0].pts_us, packet.pts_us);
+    EXPECT_EQ(chunks[0].sample_clock_pts_us, clock);
+    ring.push(std::move(chunks[0]));
+  }
+  std::int64_t filled = 0;
+  const auto pcm = ring.extract(1'480'000, 2'455'000, &filled);
+  EXPECT_EQ(pcm.size(), 46800u * 2);
+  EXPECT_EQ(filled, 975'000);
+  EXPECT_TRUE(std::all_of(pcm.begin(), pcm.end(), [](auto value) { return value == 257; }));
+}
+
+TEST(AudioDecode, MissingRawSequenceAndExcessiveClockJumpsNeverInventCoverage) {
+  for (const bool sequence_gap : {true, false}) {
+    RawPcmAudioDecoder decoder;
+    ASSERT_TRUE(decoder.open(k230::CodecId::Raw));
+    PcmRing ring;
+    k230::MediaPacket packet;
+    packet.codec = k230::CodecId::Raw;
+    packet.stream = k230::StreamType::Audio;
+    packet.data.assign(4096, 1);
+    packet.pts_us = 1'000'000;
+    std::vector<PcmChunk> chunks;
+    ASSERT_TRUE(decoder.decode(packet, chunks));
+    ring.push(std::move(chunks.back()));
+    packet.seq = sequence_gap ? 2 : 1;
+    packet.pts_us += sequence_gap ? 42666 : 24334;
+    ASSERT_TRUE(decoder.decode(packet, chunks));
+    EXPECT_EQ(chunks.back().pts_us, packet.pts_us);
+    EXPECT_EQ(chunks.back().sample_clock_pts_us, packet.pts_us);
+    EXPECT_TRUE(chunks.back().timing_discontinuity);
+    ring.push(std::move(chunks.back()));
+    std::int64_t filled = 0;
+    bool contiguous = true;
+    ring.extract(1'000'000, 1'064'000, &filled, &contiguous);
+    EXPECT_LT(filled, 64'000);
+    EXPECT_FALSE(contiguous);
+  }
+}
+
+TEST(AudioDecode, SequenceLossCannotClaimContinuityEvenWhenPtsDoesNotExposeAHole) {
+  RawPcmAudioDecoder decoder;
+  ASSERT_TRUE(decoder.open(k230::CodecId::Raw));
+  PcmRing ring;
+  k230::MediaPacket packet;
+  packet.codec = k230::CodecId::Raw;
+  packet.stream = k230::StreamType::Audio;
+  packet.data.assign(4096, 1);
+  packet.pts_us = 1'000'000;
+  std::vector<PcmChunk> chunks;
+  ASSERT_TRUE(decoder.decode(packet, chunks));
+  ring.push(std::move(chunks.back()));
+  packet.seq = 2;
+  packet.pts_us += 21333;
+  ASSERT_TRUE(decoder.decode(packet, chunks));
+  ring.push(std::move(chunks.back()));
+  bool contiguous = true;
+  std::int64_t filled = 0;
+  ring.extract(1'000'000, 1'042'000, &filled, &contiguous);
+  EXPECT_EQ(filled, 42'000);
+  EXPECT_FALSE(contiguous);
 }
 
 TEST(FrameDump, PngIsDecodableAndPreservesPixels) {

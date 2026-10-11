@@ -4,6 +4,7 @@ add_library(k230_bridge STATIC
   src/adb_controller.cpp
   src/scrcpy_session.cpp
   src/verdict_dispatcher.cpp
+  src/force_stop_executor.cpp
   src/companion_dispatcher.cpp
   src/layout_receiver.cpp
 )
@@ -17,3 +18,8 @@ target_link_libraries(k230_bridge PUBLIC k230_common)
 # the phone stream to a file for offline inspector development.
 add_executable(k230-bridge src/main.cpp)
 target_link_libraries(k230-bridge PRIVATE k230_bridge)
+
+if(K230_TARGET STREQUAL "little")
+  add_executable(k230-mvp-force-stop-probe ${PROJECT_SOURCE_DIR}/tools/mvp_force_stop_probe.cpp)
+  target_link_libraries(k230-mvp-force-stop-probe PRIVATE k230_bridge)
+endif()
